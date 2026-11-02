@@ -220,9 +220,11 @@ fast resolver instead of making a third of the queries wait 400 ms) and packet
 loss (it retries and hedges instead of waiting out a timeout).
 
 `hmrdbench resolver` runs one such resolver as a server, forwarding the names of
-a tunnel domain to a tunnel server, and `hmrdbench http` serves a download and
-upload target, for end-to-end tunnel benchmarks (hiddify-sing-box has one in
-`test/dnstunnel-bench`).
+a tunnel domain to a tunnel server, `hmrdbench http` serves a download and
+upload target, and `hmrdbench pool -listen 127.0.0.1:5353 -resolver a
+-resolver b` serves the relay on a local address, for tunnel clients that are
+not written in Go (Slipstream). hiddify-sing-box uses them in its end-to-end
+tunnel benchmark, `test/dnstunnel-bench`.
 
 ## Usage — as a `net.PacketConn` for DNS-tunnel protocols
 

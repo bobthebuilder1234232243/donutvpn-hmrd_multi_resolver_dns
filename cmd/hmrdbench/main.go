@@ -9,6 +9,8 @@
 //	                     exceeds its rate
 //	hmrdbench http       an HTTP target for tunnel tests: GET /down?bytes=N,
 //	                     POST /up
+//	hmrdbench pool       the relay on a fixed local address, in front of the
+//	                     given resolvers, for tunnel clients outside Go
 package main
 
 import (
@@ -28,6 +30,8 @@ func main() {
 		err = runResolver(os.Args[2:])
 	case "http":
 		err = runHTTP(os.Args[2:])
+	case "pool":
+		err = runPool(os.Args[2:])
 	default:
 		usage()
 	}
@@ -38,9 +42,10 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: hmrdbench bench|resolver|http [flags]
+	fmt.Fprintln(os.Stderr, `usage: hmrdbench bench|resolver|http|pool [flags]
   bench     library benchmark of the relay (run with -h for flags)
   resolver  rate-limited test resolver
-  http      HTTP download/upload target`)
+  http      HTTP download/upload target
+  pool      the relay on a fixed local address, in front of resolvers`)
 	os.Exit(2)
 }

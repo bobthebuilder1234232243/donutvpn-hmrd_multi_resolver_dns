@@ -175,6 +175,55 @@ mgr, addr, err := multidns.StartLocal(multidns.Options{LoadBalance: multidns.LBA
 _ = mgr.Submit(wireQuery, func(answer []byte) { /* answer carries wireQuery's ID */ })
 ```
 
+## Benchmark
+
+`cmd/hmrdbench` measures how many queries a second each approach gets answered
+through rate-limited, dead, slow and lossy resolvers. It needs nothing but Go:
+
+```bash
+go run ./cmd/hmrdbench bench                    # every scenario, about 9 minutes
+go run ./cmd/hmrdbench bench -scenarios three-limited -duration 10s -v
+```
+
+It starts the resolvers in-process (UDP, 20 ms latency plus up to 10 ms of
+jitter unless the scenario sets another) and drives each approach with 64
+queries in flight in a closed loop, like a DNS tunnel's window: a worker sends
+its next query when the previous one is answered, or 200 ms after it failed,
+like a retransmission timer. A query counts as answered on a `NOERROR` answer.
+The approaches:
+
+- **auto (relay)**: `Submit` with `LBAuto`, the path a DNS tunnel uses through
+  `StartLocal` or `PacketConn`;
+- **round robin (relay)**: the same with `LBRoundRobin`;
+- **Resolve (sync)**: `Manager.Resolve`, a synchronous exchange per query;
+- **plain multi-resolver**: one socket per resolver, round robin, no retry and
+  no rate awareness, as most clients' multi-resolver support works;
+- **single resolver**: the first resolver alone.
+
+Answered queries per second, 15 s per run:
+
+| Resolvers | auto (relay) | round robin (relay) | Resolve (sync) | plain multi-resolver | single resolver |
+|---|---|---|---|---|---|
+| 1 unlimited | **2528** | 2539 | 2521 | 2543 | 2541 |
+| 1 limited to 30/s | **31.9** | 31.9 | 31.9 | 31.9 | 31.9 |
+| 3 unlimited | **2542** | 2546 | 2523 | 2538 | 2541 |
+| 3 limited: 20/s and 30/s refusing, 40/s dropping | **96.3** | 96.8 | 63.7 | 95.6 | 21.3 |
+| 30/s refusing, 40/s dropping, 1 dead | **73.5** | 71.1 | 62.0 | 60.0 | 31.9 |
+| 3 unlimited, 20, 100 and 400 ms | **2400** | 362 | 883 | 362 | 2540 |
+| 3 unlimited, 0%, 10% and 30% loss | **2429** | 2416 | 2444 | 189 | 2545 |
+
+Where the resolvers differ only in their rate limits, the relay and a plain
+multi-resolver both keep every resolver saturated and reach the same ceiling,
+the sum of the limits. The relay pulls ahead when resolvers differ in ways round
+robin cannot see: a dead resolver, uneven latency (it sends the traffic to the
+fast resolver instead of making a third of the queries wait 400 ms) and packet
+loss (it retries and hedges instead of waiting out a timeout).
+
+`hmrdbench resolver` runs one such resolver as a server, forwarding the names of
+a tunnel domain to a tunnel server, and `hmrdbench http` serves a download and
+upload target, for end-to-end tunnel benchmarks (hiddify-sing-box has one in
+`test/dnstunnel-bench`).
+
 ## Usage — as a `net.PacketConn` for DNS-tunnel protocols
 
 DNS-tunnel protocols like [dnstt](https://github.com/net2share/vaydns) (used by hiddify) speak raw DNS wire format to a recursive resolver and care most about *delivery reliability* — if the resolver they're using gets rate-limited or blocked, the whole tunnel stalls. The library exposes its smart pool as a `net.PacketConn` so it can drop in wherever such a protocol expects one:

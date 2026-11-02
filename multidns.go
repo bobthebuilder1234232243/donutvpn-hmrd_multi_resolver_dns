@@ -43,6 +43,9 @@ type Manager struct {
 	// local is non-nil when this Manager was built via StartLocal. Close
 	// then also tears down the bundled UDP+TCP listener.
 	local *localListener
+
+	// relay is the asynchronous path of StartLocal and PacketConn.
+	relay *relay
 }
 
 // New constructs a Manager. The returned manager is ready for AddResolver
@@ -51,12 +54,24 @@ type Manager struct {
 func New(opts Options) *Manager {
 	opts.applyDefaults()
 	probeCtx, cancel := context.WithCancel(context.Background())
-	return &Manager{
+	m := &Manager{
 		opts:        opts,
-		pool:        newPool(&opts),
 		probeCtx:    probeCtx,
 		probeCancel: cancel,
 	}
+	m.pool = newPool(&m.opts)
+	m.relay = newRelay(m)
+	return m
+}
+
+// Submit sends a raw DNS query (wire format) through the pool's relay and
+// returns at once. deliver is called once with the answer, carrying the
+// query's ID: the first resolver's answer, or the last error answer when
+// every attempt failed. deliver runs on a relay goroutine and must not block.
+// This is the high-throughput path for DNS tunnels; Resolve is the
+// synchronous one.
+func (m *Manager) Submit(wire []byte, deliver func([]byte)) error {
+	return m.relay.Submit(wire, deliver)
 }
 
 // AddResolver registers a new upstream and starts its prober. The returned id
@@ -93,6 +108,9 @@ func (m *Manager) AddResolver(cfg ResolverConfig) (string, error) {
 	}
 	id := fmt.Sprintf("r-%d", m.idSeq.Add(1))
 	rs := newResolverState(id, cfg, up, &m.opts)
+	if cfg.Protocol == ProtoUDP {
+		rs.dg = newDgram(rs, m.relay)
+	}
 	m.pool.add(rs)
 	m.startProbe(rs)
 	m.mu.Unlock()
@@ -115,6 +133,9 @@ func (m *Manager) RemoveResolver(id string) error {
 	rs.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if rs.dg != nil {
+		rs.dg.close()
 	}
 	if err := rs.up.Close(); err != nil {
 		m.opts.Logger.Warnf("multidns: closing resolver %s: %v", id, err)
@@ -180,6 +201,7 @@ func (m *Manager) Close() error {
 
 	m.probeCancel()
 	m.probeWG.Wait()
+	m.relay.close()
 
 	for _, r := range m.pool.snapshot() {
 		_ = r.up.Close()

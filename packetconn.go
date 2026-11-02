@@ -1,7 +1,6 @@
 package multidns
 
 import (
-	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -45,7 +44,7 @@ type packetConn struct {
 func newPacketConn(mgr *Manager) *packetConn {
 	return &packetConn{
 		mgr:    mgr,
-		recvCh: make(chan []byte, 64),
+		recvCh: make(chan []byte, 4096),
 		closed: make(chan struct{}),
 	}
 }
@@ -75,43 +74,19 @@ func (p *packetConn) WriteTo(buf []byte, _ net.Addr) (int, error) {
 		return 0, err
 	}
 
-	// Snapshot the bytes — buf is owned by the caller after this returns.
-	n := len(buf)
-
-	p.wg.Add(1)
-	go p.dispatch(msg)
-	return n, nil
-}
-
-func (p *packetConn) dispatch(query *dns.Msg) {
-	defer p.wg.Done()
-
-	ctx := context.Background()
-	if dl := p.writeDeadline.Load(); dl != nil && !dl.IsZero() {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, *dl)
-		defer cancel()
+	// The relay copies buf; the answer lands on a later ReadFrom. A full
+	// receive queue drops the answer, as a UDP socket would: blocking here
+	// would stall the relay for every other query.
+	if err := p.mgr.relay.Submit(buf, func(resp []byte) {
+		select {
+		case p.recvCh <- resp:
+		case <-p.closed:
+		default:
+		}
+	}); err != nil {
+		return 0, err
 	}
-
-	resp, err := p.mgr.Resolve(ctx, query)
-	if err != nil || resp == nil {
-		// Smart pool already classified, throttled, and (if appropriate)
-		// pushed the resolver toward its down state. Nothing for the
-		// PacketConn layer to do — the caller's tunnel will time out on
-		// this query if it doesn't get a response, and the next WriteTo
-		// will go to a different resolver.
-		return
-	}
-
-	out, err := resp.Pack()
-	if err != nil {
-		return
-	}
-
-	select {
-	case p.recvCh <- out:
-	case <-p.closed:
-	}
+	return len(buf), nil
 }
 
 // ReadFrom blocks until either a response arrives, the read deadline fires,

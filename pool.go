@@ -88,6 +88,9 @@ func (p *pool) candidates() []*resolverState {
 	}
 
 	switch p.opts.LoadBalance {
+	case LBAuto:
+		sortByCost(healthy)
+		sortByCost(limited)
 	case LBLowestLatency:
 		sortByLatency(healthy)
 		sortByLatency(limited)
@@ -107,6 +110,13 @@ func (p *pool) candidates() []*resolverState {
 	out = append(out, healthy...)
 	out = append(out, limited...)
 	return out
+}
+
+// sortByCost orders by LBAuto's cost, equal costs in random order.
+func sortByCost(rs []*resolverState) {
+	rand.Shuffle(len(rs), func(i, j int) { rs[i], rs[j] = rs[j], rs[i] })
+	unmeasured := bestLatency(rs)
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].cost(unmeasured) < rs[j].cost(unmeasured) })
 }
 
 func sortByLatency(rs []*resolverState) {
@@ -179,7 +189,12 @@ func rotate(rs []*resolverState, by int) {
 	copy(rs[len(rs)-by:], tmp[:by])
 }
 
-// resolve runs the deadline-aware retry across candidates.
+// resolve runs the deadline-aware retry across candidates, with hedging: a
+// candidate that has not answered within its hedge delay is kept running
+// while the next one is tried, up to MaxInFlight at once; the first answer
+// wins and the other attempts are cancelled without being charged. A
+// resolver that drops packets therefore costs a fraction of its timeout, not
+// all of it.
 func (p *pool) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	candidates := p.candidates()
 	if len(candidates) == 0 {
@@ -192,24 +207,77 @@ func (p *pool) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 		candidates = all
 	}
 
+	hedgeCtx, cancelHedges := context.WithCancel(ctx)
+	defer cancelHedges()
+
+	type result struct {
+		resp *dns.Msg
+		err  error
+		ok   bool
+	}
+	results := make(chan result, len(candidates)+1)
+	maxInFlight := p.opts.MaxInFlight
+	if p.opts.DisableHedging || maxInFlight < 1 {
+		maxInFlight = 1
+	}
+
 	var lastErr error
 	everSent := false
-	for _, c := range candidates {
-		if ctx.Err() != nil {
-			break
+	inFlight := 0
+	next := 0
+	var last *resolverState
+	// launch starts the next candidate the bucket admits; false when none is left.
+	launch := func() bool {
+		for next < len(candidates) {
+			c := candidates[next]
+			next++
+			if !c.bucket.tryAcquire(time.Now()) {
+				lastErr = errThrottled
+				continue
+			}
+			everSent = true
+			inFlight++
+			last = c
+			go func() {
+				resp, err, ok := p.attempt(hedgeCtx, c, q)
+				results <- result{resp: resp, err: err, ok: ok}
+			}()
+			return true
 		}
-		now := time.Now()
-		if !c.bucket.tryAcquire(now) {
-			lastErr = errThrottled
-			continue
+		return false
+	}
+
+	launch()
+	for inFlight > 0 {
+		var hedge <-chan time.Time
+		var timer *time.Timer
+		if inFlight < maxInFlight && next < len(candidates) && last != nil {
+			timer = time.NewTimer(last.hedgeDelay())
+			hedge = timer.C
 		}
-		resp, err, ok := p.attempt(ctx, c, q)
-		if ok {
-			return resp, nil
+		select {
+		case r := <-results:
+			inFlight--
+			if r.ok {
+				if timer != nil {
+					timer.Stop()
+				}
+				return r.resp, nil
+			}
+			if r.err != nil && !errors.Is(r.err, context.Canceled) {
+				lastErr = r.err
+			}
+			launch()
+		case <-hedge:
+			launch()
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return nil, errors.Join(ErrAllResolversFailed, ctx.Err())
 		}
-		everSent = true
-		if err != nil {
-			lastErr = err
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 
@@ -235,9 +303,12 @@ func (p *pool) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 }
 
 func (p *pool) attempt(ctx context.Context, c *resolverState, q *dns.Msg) (*dns.Msg, error, bool) {
-	attemptCtx, cancel := capContext(ctx, c.cfg.Timeout)
+	attemptCtx, cancel := capContext(ctx, c.attemptTimeout())
 	start := time.Now()
+	c.inflight.Add(1)
+	c.sent.Add(1)
 	resp, err := c.up.Exchange(attemptCtx, q)
+	c.inflight.Add(-1)
 	cancel()
 	latency := time.Since(start)
 
@@ -246,7 +317,8 @@ func (p *pool) attempt(ctx context.Context, c *resolverState, q *dns.Msg) (*dns.
 	// caller cancellation as an i/o timeout, which classify would otherwise
 	// route to failTimeout and eventually drive a healthy resolver to the
 	// down state. Distinguishing here, where we still have access to the
-	// parent ctx, is the only reliable place.
+	// parent ctx, is the only reliable place. A hedged attempt that lost to
+	// another resolver's answer ends the same way.
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return nil, ctx.Err(), false
 	}

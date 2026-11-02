@@ -43,22 +43,35 @@ func StartLocal(opts Options) (*Manager, string, error) {
 
 	mgr := New(opts)
 	handler := dns.HandlerFunc(makeLocalHandler(mgr))
-	udpSrv := &dns.Server{PacketConn: pc, Handler: handler}
 	tcpSrv := &dns.Server{Listener: ln, Handler: handler}
 
 	mgr.local = &localListener{
-		udp:         udpSrv,
 		tcp:         tcpSrv,
 		udpConn:     pc,
 		tcpListener: ln,
 		addr:        addr,
 	}
 
+	// UDP goes straight through the relay: no unpacking, no goroutine and no
+	// socket per query, the answer written back as soon as it arrives.
 	mgr.local.wg.Add(2)
 	go func() {
 		defer mgr.local.wg.Done()
-		if err := udpSrv.ActivateAndServe(); err != nil && !mgr.local.shuttingDown() {
-			mgr.opts.Logger.Errorf("multidns: local udp listener exited: %v", err)
+		buf := make([]byte, 65535)
+		for {
+			n, client, err := pc.ReadFrom(buf)
+			if err != nil {
+				if !mgr.local.shuttingDown() {
+					mgr.opts.Logger.Errorf("multidns: local udp listener exited: %v", err)
+				}
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			_ = mgr.relay.Submit(buf[:n], func(resp []byte) {
+				_, _ = pc.WriteTo(resp, client)
+			})
 		}
 	}()
 	go func() {
@@ -75,7 +88,6 @@ func StartLocal(opts Options) (*Manager, string, error) {
 // shutdown bookkeeping. A separate type keeps Manager small for the
 // (still common) case where StartLocal isn't used.
 type localListener struct {
-	udp         *dns.Server
 	tcp         *dns.Server
 	udpConn     net.PacketConn
 	tcpListener net.Listener

@@ -20,6 +20,7 @@ This library makes those concerns first-class:
 
 - Per-query retry on the next resolver while strictly respecting
   `ctx.Deadline`.
+- **Hedged attempts**: a candidate that has not answered within a latency-derived delay keeps running while the next one is tried; the first answer wins and the losers are cancelled without being charged. A resolver that drops packets costs a fraction of its timeout, not all of it.
 - Failure classifier feeds an **AIMD throttle** per resolver; rate-limit
   signals (`REFUSED`, `SERVFAIL`, HTTP 429) cut the cap, sustained success
   grows it back. No operator pre-tuning.
@@ -45,7 +46,8 @@ first-class DNS proxy with per-query semantics.
 | Deadline-aware retry across candidates | `pool.go` |
 | AIMD rate-limit throttling per resolver | `health.go`, `ratelimit.go` |
 | Background recovery probing using the failing query | `prober.go` |
-| Round-robin / weighted / lowest-latency LB strategies | `pool.go` |
+| Asynchronous relay for DNS tunnels: one long-lived socket per resolver, ID rewriting, instant fallback, pacing, hedging, probing with live queries, fanout | `relay.go` |
+| Auto (capacity-aware) / round-robin / weighted / lowest-latency LB strategies | `relay.go`, `pool.go` |
 | Dynamic `AddResolver` / `RemoveResolver` at runtime | `multidns.go` |
 | Custom `DialFunc` injection on every transport | `resolver.go` |
 | Optional UDP+TCP DNS server listener | `server.go` |
@@ -127,6 +129,52 @@ go run ./example \
     -stats 5s
 ```
 
+## The relay: the high-throughput path for DNS tunnels
+
+`Resolve` runs one synchronous exchange per attempt, which suits a stub
+resolver. A DNS tunnel sends hundreds of queries a second and keeps many in
+flight, so `StartLocal`'s UDP listener, `PacketConn` and `Manager.Submit` use
+the relay instead (`relay.go`):
+
+- **One long-lived socket per UDP resolver**, opened through the resolver's
+  `Dialer` when set. Query IDs are rewritten to multiplex every client query
+  over it, and restored on the answer. No goroutine, socket or unpacking per
+  query; TCP, DoT and DoH resolvers run an exchange per attempt.
+- **Capacity-aware scheduling** (`LBAuto`). Each resolver's rate cap is
+  learned from what it really answers: on a refusal, or a run of drops while
+  it still answers others, the cap becomes 90% of its recent success rate,
+  and it grows 10% a second while the resolver keeps answering. Queries go
+  where there is spare capacity, so a resolver limited to 20 queries a second
+  gets about a third of what a 60 one gets, and the total approaches the sum
+  of their limits.
+- **Instant fallback.** A `REFUSED` or `SERVFAIL` answer is retried at once on
+  another resolver, up to `MaxAttempts` resolvers per query.
+- **Overflow in proportion.** A query that finds every resolver at its cap is
+  sent at once to the resolver with the most capacity left relative to its
+  cap, so the overflow is spread like the rest. Waiting would add delay to
+  every query of a saturated tunnel, which costs more than the refusal it
+  retransmits; `PacingMaxWait` turns waiting on for clients that prefer it.
+- **Timeouts like TCP's.** Each attempt gets the resolver's mean latency plus
+  four deviations, so a lossy resolver is given up quickly while a tunnel
+  server that holds polls for a second is not mistaken for a lossy one.
+- **Hedging only where it pays.** A resolver that lost packets in the last
+  `HedgeLossWindow` has its unanswered queries also sent to another resolver
+  after its mean latency plus two deviations; a healthy one is never hedged,
+  so no quota is spent on second copies.
+- **Probing with live queries.** A down resolver gets a copy of a live query
+  every `RelayProbeInterval` and is back in service on its first answer.
+- **Fanout.** `SpreadCount` sends every query to several resolvers (`-1`: all)
+  and keeps the first answer.
+
+The first answer wins and later ones are dropped. A query no resolver
+answered gets the last error answer, or `SERVFAIL`, so the client can retry.
+
+```go
+mgr, addr, err := multidns.StartLocal(multidns.Options{LoadBalance: multidns.LBAuto})
+// point the tunnel at addr; add resolvers with mgr.AddResolverURL("8.8.8.8")
+_ = mgr.Submit(wireQuery, func(answer []byte) { /* answer carries wireQuery's ID */ })
+```
+
 ## Usage — as a `net.PacketConn` for DNS-tunnel protocols
 
 DNS-tunnel protocols like [dnstt](https://github.com/net2share/vaydns) (used by hiddify) speak raw DNS wire format to a recursive resolver and care most about *delivery reliability* — if the resolver they're using gets rate-limited or blocked, the whole tunnel stalls. The library exposes its smart pool as a `net.PacketConn` so it can drop in wherever such a protocol expects one:
@@ -174,12 +222,29 @@ mgr.AddResolver(multidns.ResolverConfig{
 |---|---|---|
 | `DefaultDeadline` | 5s | Applied when the caller's `ctx` has no deadline. |
 | `DefaultResolverTimeout` | 2s | Per-attempt cap. Smaller than `DefaultDeadline` so failover fits inside one query. |
-| `LoadBalance` | `LBRoundRobin` | `LBRoundRobin` / `LBWeighted` / `LBLowestLatency`. |
+| `LoadBalance` | `LBRoundRobin` | `LBAuto` / `LBRoundRobin` / `LBWeighted` / `LBLowestLatency`. `LBAuto` sends each query to the resolver with the most spare capacity (power of two choices over in-flight queries, latency and loss, within each resolver's learned rate cap); use it for DNS tunnels. |
 | `ProbeInterval` | 5s | How often a `down` resolver is re-tried with its failing query. |
 | `DownAfterFailures` | 8 | Consecutive timeout/network failures before a resolver is moved to `down`. |
-| `RateLimitFloorRPM` | 6 | Hard floor for the AIMD cap. |
-| `RateLimitUncapRPM` | 600 | Cap above this is treated as "uncapped". |
-| `RateLimitAdditive` | 5 | Per-minute additive increase under sustained success. |
+| `RateLimitFloorRPM` | 6 | Hard floor for the cap. |
+| `RateLimitUncapRPM` | 60000 | A cap that grows past this is lifted at once. The default is far above any resolver, so caps are lifted by `RateLimitUncapAfter`. |
+| `RateLimitAdditive` | 5 | Smallest step the cap grows by per recovery interval. |
+| `RateLimitWindow` | 3s | How far back the success rate is measured when a resolver refuses. |
+| `RateLimitDecreaseFactor` | 0.9 | On a refusal the cap becomes this share of the measured success rate (and of the current cap, if lower). A burst of refusals within one recovery interval counts once. |
+| `RateLimitIncreaseFactor` | 0.1 | Share of the cap added every recovery interval without a refusal. |
+| `RateLimitRecoveryInterval` | 1s | How often the cap grows while the resolver keeps answering. |
+| `RateLimitUncapAfter` | 15s | The cap is lifted once no refusal has been seen for this long. |
+| `HedgeDelay` | 0 (adaptive) | Wait before the same query is also sent to the next candidate. Adaptive: a resolver that lost packets within `HedgeLossWindow` is hedged after its mean latency plus two deviations, within [`HedgeMinDelay`, attempt timeout]; one with no recent loss gets its whole attempt timeout, so a rate-limited resolver's quota is not spent on second copies. |
+| `HedgeMinDelay` | 100ms | Lower bound of the adaptive hedge delay. |
+| `HedgeLossWindow` | 10s | How far back a timeout makes a resolver "lossy" for hedging. |
+| `MaxInFlight` | 2 | Attempts of one query that may run at once. |
+| `DisableHedging` | false | Strictly sequential attempts. |
+| `AdaptiveTimeoutMin` | 300ms | Lower bound of the adaptive per-attempt timeout (mean latency plus four deviations, never above the resolver's `Timeout`). |
+| `DisableAdaptiveTimeout` | false | Always use the resolver's full `Timeout` per attempt. |
+| `MaxAttempts` | 3 | Resolvers one relayed query is sent to, retries and hedges included. |
+| `SpreadCount` | 1 | Copies of every relayed query sent at once to different resolvers; `-1` sends to all. |
+| `PacingMaxWait` | 0 | When set, how long a relayed query waits for a resolver under its cap before it is sent anyway. 0 sends at once to the resolver with the most capacity left. |
+| `RelayProbeInterval` | 1s | How often a down resolver gets a copy of a live query. |
+| `RelayTick` | 10ms | Timer of the relay's timeouts, hedges and pacing. |
 | `Logger` | no-op | Adapter to your logging system; `log/slog`-friendly shape. |
 
 ### `ResolverConfig`

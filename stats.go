@@ -22,6 +22,9 @@ type ResolverStat struct {
 	RateLimited   int64
 	CurrentRPMCap int
 	RecentRPM     int
+	InFlight      int64
+	Sent          int64
+	LossRate      float64
 	LatencyEWMA   time.Duration
 	LastValid     time.Time
 	LastFail      time.Time

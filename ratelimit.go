@@ -31,6 +31,26 @@ func (s *slidingCounter) sum(now time.Time) int64 {
 	return total
 }
 
+// sumLast returns the events of the last seconds (1 to 60), the current
+// second included.
+func (s *slidingCounter) sumLast(now time.Time, seconds int) int64 {
+	if seconds <= 0 {
+		seconds = 1
+	}
+	if seconds > 60 {
+		seconds = 60
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nowSec := now.Unix()
+	s.advance(nowSec)
+	var total int64
+	for i := int64(0); i < int64(seconds); i++ {
+		total += s.buckets[((nowSec-i)%60+60)%60]
+	}
+	return total
+}
+
 func (s *slidingCounter) advance(nowSec int64) {
 	if s.last == 0 {
 		s.last = nowSec
@@ -59,6 +79,7 @@ type tokenBucket struct {
 	tokens     float64
 	burst      float64
 	lastRefill time.Time
+	denied     time.Time
 }
 
 func newTokenBucket(capPerMin int) *tokenBucket {
@@ -76,9 +97,11 @@ func (tb *tokenBucket) setCap(capPerMin int) {
 		tb.burst = 0
 		return
 	}
-	burst := float64(capPerMin) / 4
-	if burst < 1 {
-		burst = 1
+	// a burst of about one second: a larger one overruns a resolver's
+	// per-second limit before the cap can react
+	burst := float64(capPerMin) / 60
+	if burst < 2 {
+		burst = 2
 	}
 	if burst > float64(capPerMin) {
 		burst = float64(capPerMin)
@@ -98,6 +121,29 @@ func (tb *tokenBucket) cap() int {
 	return tb.capPerMin
 }
 
+// level is how full the bucket is, 0 to 1 (1 when uncapped): the share of
+// its burst a resolver could still take right now.
+func (tb *tokenBucket) level(now time.Time) float64 {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.capPerMin <= 0 || tb.burst <= 0 {
+		return 1
+	}
+	tb.refillLocked(now)
+	return tb.tokens / tb.burst
+}
+
+// available reports whether a permit could be taken now, without taking it.
+func (tb *tokenBucket) available(now time.Time) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.capPerMin <= 0 {
+		return true
+	}
+	tb.refillLocked(now)
+	return tb.tokens >= 1
+}
+
 // tryAcquire returns true if a permit was available. When capPerMin == 0 it
 // always returns true (no cap).
 func (tb *tokenBucket) tryAcquire(now time.Time) bool {
@@ -111,7 +157,15 @@ func (tb *tokenBucket) tryAcquire(now time.Time) bool {
 		tb.tokens--
 		return true
 	}
+	tb.denied = now
 	return false
+}
+
+// deniedSince reports whether the bucket held a query back after t.
+func (tb *tokenBucket) deniedSince(t time.Time) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.denied.After(t)
 }
 
 func (tb *tokenBucket) refillLocked(now time.Time) {

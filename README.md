@@ -229,7 +229,8 @@ mgr.AddResolver(multidns.ResolverConfig{
 | `RateLimitUncapRPM` | 60000 | A cap that grows past this is lifted at once. The default is far above any resolver, so caps are lifted by `RateLimitUncapAfter`. |
 | `RateLimitAdditive` | 5 | Smallest step the cap grows by per recovery interval. |
 | `RateLimitWindow` | 3s | How far back the success rate is measured when a resolver refuses. |
-| `RateLimitDecreaseFactor` | 0.9 | On a refusal the cap becomes this share of the measured success rate (and of the current cap, if lower). A burst of refusals within one recovery interval counts once. |
+| `RateLimitDecreaseFactor` | 1.2 | On a refusal the cap becomes this many times the resolver's answer rate over `RateLimitWindow`, overflow included. Above 1 keeps a refusing resolver saturated: a refusal comes back at once and costs only a retry. A burst of refusals within one recovery interval counts once. |
+| `RateLimitDropFactor` | 1.15 | The same when a resolver drops queries while it still answers others: a little above its answer rate so it can show it takes more, but less than for refusals, as a dropped query costs the client a whole timeout. |
 | `RateLimitIncreaseFactor` | 0.1 | Share of the cap added every recovery interval without a refusal. |
 | `RateLimitRecoveryInterval` | 1s | How often the cap grows while the resolver keeps answering. |
 | `RateLimitUncapAfter` | 15s | The cap is lifted once no refusal has been seen for this long. |

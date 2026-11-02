@@ -380,3 +380,52 @@ func TestRelaySilentDropperIsNotTakenDown(t *testing.T) {
 		t.Fatalf("the test did not overload it: %+v", st)
 	}
 }
+
+// startDelayed is an unlimited resolver that answers after delay.
+func startDelayed(t *testing.T, delay time.Duration, served *atomic.Int64) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		time.AfterFunc(delay, func() {
+			served.Add(1)
+			m := new(dns.Msg)
+			m.SetReply(r)
+			_ = w.WriteMsg(m)
+		})
+	})}
+	go srv.ActivateAndServe()
+	t.Cleanup(func() { srv.Shutdown() })
+	return pc.LocalAddr().String()
+}
+
+// LBAuto gives an unlimited fast resolver the traffic instead of spreading it
+// evenly over a slow one, while still sampling the slow one now and then.
+func TestRelayAutoPrefersFastResolver(t *testing.T) {
+	var fastServed, slowServed atomic.Int64
+	fast := startDelayed(t, 5*time.Millisecond, &fastServed)
+	slow := startDelayed(t, 150*time.Millisecond, &slowServed)
+	m := New(Options{LoadBalance: LBAuto})
+	defer m.Close()
+	_, _ = m.AddResolverURL(slow)
+	_, _ = m.AddResolverURL(fast)
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				submitWait(t, m, uint16(w*100+i), "p.test", 2*time.Second)
+			}
+		}(w)
+	}
+	wg.Wait()
+	if slowServed.Load() == 0 {
+		t.Fatal("the slow resolver was never sampled")
+	}
+	if fastServed.Load() < 10*slowServed.Load() {
+		t.Fatalf("traffic not concentrated on the fast resolver: fast %d, slow %d", fastServed.Load(), slowServed.Load())
+	}
+}

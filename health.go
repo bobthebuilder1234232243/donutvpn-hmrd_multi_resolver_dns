@@ -111,11 +111,18 @@ type resolverState struct {
 	inflight  atomic.Int64
 	sent      atomic.Int64
 	lastProbe atomic.Int64
+	lastSend  atomic.Int64
 
-	recentReqs     slidingCounter
-	recentOK       slidingCounter
-	recentRL       slidingCounter
+	recentReqs slidingCounter
+	recentOK   slidingCounter
+	recentRL   slidingCounter
+	// recentTaught counts the refusals and drops of queries sent within the
+	// cap: only these say the cap is too high, and only these hold its growth
+	recentTaught   slidingCounter
 	recentTimeouts slidingCounter
+	// recentLoss counts timeouts of queries sent within the cap: the loss a
+	// resolver shows on its own, not the overflow the relay sent it
+	recentLoss slidingCounter
 
 	bucket *tokenBucket
 
@@ -202,10 +209,14 @@ func (rs *resolverState) recordOutcome(now time.Time, kind failKind, latency tim
 		rs.mu.Lock()
 		rs.lastFail = now
 		rs.mu.Unlock()
+		if teach {
+			rs.recentLoss.add(now, 1)
+		}
 		// A resolver that drops queries while it still answers others is
 		// rate limiting silently: cap it like one that refuses.
 		if teach && rs.recentOK.sumLast(now, 2) > 0 && rs.recentTimeouts.sumLast(now, 2) >= 3 {
-			rs.applyRateLimitDecrease(now)
+			rs.recentTaught.add(now, 1)
+			rs.applyRateLimitDecrease(now, rs.opts.RateLimitDropFactor)
 		}
 		rs.maybeMarkDown(q)
 
@@ -226,7 +237,8 @@ func (rs *resolverState) recordOutcome(now time.Time, kind failKind, latency tim
 		rs.lastFail = now
 		rs.mu.Unlock()
 		if teach {
-			rs.applyRateLimitDecrease(now)
+			rs.recentTaught.add(now, 1)
+			rs.applyRateLimitDecrease(now, rs.opts.RateLimitDecreaseFactor)
 		} else {
 			rs.mu.Lock()
 			rs.lastRateLimit = now
@@ -266,11 +278,11 @@ func (rs *resolverState) maybeMarkDown(q *dns.Msg) {
 	rs.setState(stateDown)
 }
 
-// applyRateLimitDecrease drops the cap to a share of what the resolver has
-// really been answering lately (not half of what was sent, which under a
+// applyRateLimitDecrease sets the cap to factor times what the resolver has
+// really been answering lately (not a share of what was sent, which under a
 // tunnel is mostly retransmissions). A burst of refusals from queries that
 // were already in flight counts once per recovery interval.
-func (rs *resolverState) applyRateLimitDecrease(now time.Time) {
+func (rs *resolverState) applyRateLimitDecrease(now time.Time, factor float64) {
 	rs.mu.Lock()
 	if !rs.lastDecrease.IsZero() && now.Sub(rs.lastDecrease) < rs.opts.RateLimitRecoveryInterval {
 		rs.lastRateLimit = now
@@ -287,13 +299,12 @@ func (rs *resolverState) applyRateLimitDecrease(now time.Time) {
 	if windowSec < 1 {
 		windowSec = 1
 	}
+	// Every answer counts, the overflow's too: under load the resolver's
+	// answer rate is its capacity. Stepping down from the previous cap would
+	// ratchet it to the floor, because overflow that succeeds spends the
+	// quota the queries within the cap then find empty.
 	okPerMin := float64(rs.recentOK.sumLast(now, windowSec)) / float64(windowSec) * 60
-	newCap := int(okPerMin * rs.opts.RateLimitDecreaseFactor)
-	if cap := rs.bucket.cap(); cap > 0 && okPerMin >= float64(cap)/2 {
-		// refused near the cap: step down from the cap. (The success rate
-		// under-reads a bursty client, and would drag the cap down with it.)
-		newCap = int(float64(cap) * rs.opts.RateLimitDecreaseFactor)
-	}
+	newCap := int(okPerMin * factor)
 	if newCap < rs.opts.RateLimitFloorRPM {
 		newCap = rs.opts.RateLimitFloorRPM
 	}
@@ -320,7 +331,7 @@ func (rs *resolverState) maybeAdditiveIncrease(now time.Time) {
 		return
 	}
 	intervalSec := int((rs.opts.RateLimitRecoveryInterval + time.Second - 1) / time.Second)
-	if rs.recentRL.sumLast(now, intervalSec) > 0 {
+	if rs.recentTaught.sumLast(now, intervalSec) > 0 {
 		return
 	}
 	step := int(float64(cap) * rs.opts.RateLimitIncreaseFactor)
@@ -342,19 +353,31 @@ func (rs *resolverState) maybeAdditiveIncrease(now time.Time) {
 	rs.bucket.setCap(newCap)
 }
 
-// lossRate is the share of this resolver's recent queries that timed out.
+// lossRate is the share of this resolver's recent queries sent within its
+// cap that timed out: the loss it shows on its own.
 func (rs *resolverState) lossRate(now time.Time) float64 {
 	sent := rs.recentReqs.sumLast(now, 10)
 	if sent <= 0 {
 		return 0
 	}
-	return float64(rs.recentTimeouts.sumLast(now, 10)) / float64(sent)
+	return float64(rs.recentLoss.sumLast(now, 10)) / float64(sent)
 }
 
-// cost ranks resolvers for LBAuto: queries in flight, latency and loss.
-// unmeasured is the latency assumed for a resolver with no answer yet; the
-// callers pass the best latency among its peers, so a new resolver is
-// sampled as soon as it is not busier than they are.
+// rejectRate is the share of all recent queries the resolver refused or
+// dropped, overflow included: how saturated it is. A resolver that turns away
+// a smaller share than its peers has capacity left.
+func (rs *resolverState) rejectRate(now time.Time) float64 {
+	sent := rs.recentReqs.sumLast(now, 10)
+	if sent <= 0 {
+		return 0
+	}
+	return float64(rs.recentRL.sumLast(now, 10)+rs.recentTimeouts.sumLast(now, 10)) / float64(sent)
+}
+
+// cost ranks resolvers for LBAuto: latency, weighed by recent loss and,
+// mildly, by queries in flight (sixteen in flight double it). unmeasured is
+// the latency assumed for a resolver with no answer yet; the callers pass
+// the best latency among its peers, so a new resolver is sampled at once.
 func (rs *resolverState) cost(unmeasured time.Duration) float64 {
 	latency := rs.latencyEWMA()
 	if latency <= 0 {
@@ -363,7 +386,7 @@ func (rs *resolverState) cost(unmeasured time.Duration) float64 {
 	if latency <= 0 {
 		latency = time.Millisecond
 	}
-	return float64(rs.inflight.Load()+1) * float64(latency) * (1 + 4*rs.lossRate(time.Now()))
+	return float64(latency) * (1 + rs.lossRate(time.Now())) * (1 + float64(rs.inflight.Load())/16)
 }
 
 // bestLatency is the lowest measured latency among rs, 0 when none is.

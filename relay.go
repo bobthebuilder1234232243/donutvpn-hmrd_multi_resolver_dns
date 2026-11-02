@@ -19,9 +19,10 @@ import (
 // resolver, rewrites query IDs to multiplex every client query over it,
 // and handles answers, failures and timeouts as events:
 //
-//   - each query goes to the resolver with the most spare capacity
-//     (LBAuto: power of two choices over in-flight count, latency and loss,
-//     within each resolver's learned rate cap), or by the configured strategy;
+//   - each query goes to the cheapest resolver with capacity under its
+//     learned rate cap (LBAuto: latency, loss and, mildly, queries in
+//     flight), or by the configured strategy; overflow goes to the resolver
+//     that turns away the smallest share of its queries;
 //   - a REFUSED or SERVFAIL answer is retried at once on another resolver,
 //     and teaches the resolver's rate cap;
 //   - a query that finds every resolver at its cap waits for capacity (up to
@@ -36,6 +37,10 @@ import (
 // failed is answered with the last error response, so the client can retry.
 
 var errShortPacket = errors.New("multidns: packet too short for a DNS message")
+
+// exploreInterval: LBAuto sends a query to a resolver it has not used for this
+// long, so a resolver that got faster is noticed.
+const exploreInterval = 5 * time.Second
 
 type flight struct {
 	mu          sync.Mutex
@@ -244,10 +249,12 @@ func (r *relay) pick(f *flight, now time.Time, force bool) (*resolverState, bool
 	return nil, false
 }
 
-// pickAuto is power of two choices: among the resolvers with capacity, two
-// are drawn at random and the cheaper one wins (cost: in-flight queries,
-// latency and recent loss). Load spreads in proportion to what each resolver
-// can take, without a central queue.
+// pickAuto sends the query to the cheapest resolver with capacity under its
+// cap: the lowest latency, weighed by recent loss and, mildly, by queries in
+// flight, so equal resolvers share the load while a fast one is not traded
+// for a slow one (a resolver without a rate limit takes all it is sent). A
+// resolver not used for exploreInterval gets the query instead, so its
+// latency stays measured.
 func (r *relay) pickAuto(eligible []*resolverState, now time.Time, force bool) (*resolverState, bool) {
 	unmeasured := bestLatency(eligible)
 	ready := make([]*resolverState, 0, len(eligible))
@@ -256,42 +263,60 @@ func (r *relay) pickAuto(eligible []*resolverState, now time.Time, force bool) (
 			ready = append(ready, rs)
 		}
 	}
+	rand.Shuffle(len(ready), func(i, j int) { ready[i], ready[j] = ready[j], ready[i] }) //nolint:gosec // ties
+	for _, rs := range ready {
+		last := rs.lastSend.Load()
+		if last != 0 && now.Sub(time.Unix(0, last)) > exploreInterval && rs.bucket.tryAcquire(now) {
+			return rs, false
+		}
+	}
 	for len(ready) > 0 {
-		choice := ready[rand.Intn(len(ready))] //nolint:gosec // load balancing, not security
-		if len(ready) > 1 {
-			other := ready[rand.Intn(len(ready))] //nolint:gosec
-			for other == choice {
-				other = ready[rand.Intn(len(ready))] //nolint:gosec
-			}
-			if other.cost(unmeasured) < choice.cost(unmeasured) {
-				choice = other
+		best := 0
+		bestCost := ready[0].cost(unmeasured)
+		for i := 1; i < len(ready); i++ {
+			if c := ready[i].cost(unmeasured); c < bestCost {
+				best, bestCost = i, c
 			}
 		}
-		if choice.bucket.tryAcquire(now) {
-			return choice, false
+		if ready[best].bucket.tryAcquire(now) {
+			return ready[best], false
 		}
-		// lost the token to another goroutine: drop it and draw again
-		for i, rs := range ready {
-			if rs == choice {
-				ready = append(ready[:i], ready[i+1:]...)
-				break
-			}
-		}
+		// lost the token to another goroutine: drop it and look again
+		ready = append(ready[:best], ready[best+1:]...)
 	}
 	if !force {
 		return nil, false
 	}
-	// every resolver is at its cap: the one with the most of its burst
-	// left, which spreads the overflow in proportion to the caps too
+	// Every resolver is at its cap. Overflow goes to the resolver that turns
+	// away the smallest share of its queries: the one with capacity left,
+	// which the cap has not caught up with yet. Overflow raises that share,
+	// so it spreads until every resolver is saturated, which is the most
+	// answers the resolvers give together.
 	best := eligible[0]
-	bestLevel := best.bucket.level(now)
 	for _, rs := range eligible[1:] {
-		level := rs.bucket.level(now)
-		if level > bestLevel || (level == bestLevel && rs.cost(unmeasured) < best.cost(unmeasured)) {
-			best, bestLevel = rs, level
+		if overflowBetter(rs, best, now, unmeasured) {
+			best = rs
 		}
 	}
 	return best, !best.bucket.tryAcquire(now)
+}
+
+// overflowBetter reports whether a is a better target for overflow than b:
+// a clearly smaller share turned away, then more of its burst left, then
+// lower cost.
+func overflowBetter(a, b *resolverState, now time.Time, unmeasured time.Duration) bool {
+	ra, rb := a.rejectRate(now), b.rejectRate(now)
+	if ra+0.05 < rb {
+		return true
+	}
+	if rb+0.05 < ra {
+		return false
+	}
+	la, lb := a.bucket.level(now), b.bucket.level(now)
+	if la != lb {
+		return la > lb
+	}
+	return a.cost(unmeasured) < b.cost(unmeasured)
 }
 
 // order applies the configured non-auto strategy to the eligible resolvers.
@@ -329,6 +354,7 @@ func (r *relay) send(f *flight, rs *resolverState, now time.Time, probe, overCap
 	f.mu.Unlock()
 	rs.inflight.Add(1)
 	rs.sent.Add(1)
+	rs.lastSend.Store(now.UnixNano())
 
 	if rs.dg != nil {
 		if err := rs.dg.send(a, wire); err != nil {

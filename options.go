@@ -68,10 +68,15 @@ type Options struct {
 	// delivers, so a DNS tunnel sending hundreds of queries per second and an
 	// ordinary stub resolver both get the right cap without tuning.
 	//
-	// RateLimitWindow is how far back the success rate is measured when a
+	// RateLimitWindow is how far back the answer rate is measured when a
 	// resolver refuses, or drops packets while it answers others (default
-	// 3s). RateLimitDecreaseFactor is the share of that rate the cap drops to
-	// (default 0.9). RateLimitIncreaseFactor is the share added every
+	// 3s). On a refusal the cap becomes RateLimitDecreaseFactor times that
+	// rate (default 1.2): above 1 keeps a refusing resolver saturated, which
+	// gets the most answers out of it because a refusal comes back at once
+	// and costs the client only a retry. On drops the cap becomes
+	// RateLimitDropFactor times that rate (default 1.15): a little above, so
+	// the resolver can show it takes more, but less than for refusals, as a
+	// dropped query costs the client a whole timeout. RateLimitIncreaseFactor is the share added every
 	// RateLimitRecoveryInterval (default 1s) while no refusal arrives
 	// (default 0.1, at least RateLimitAdditive per step), so the cap keeps
 	// probing just above what the resolver takes. RateLimitUncapAfter lifts
@@ -80,6 +85,7 @@ type Options struct {
 	// when the cap grows past that rate.
 	RateLimitWindow           time.Duration
 	RateLimitDecreaseFactor   float64
+	RateLimitDropFactor       float64
 	RateLimitIncreaseFactor   float64
 	RateLimitRecoveryInterval time.Duration
 	RateLimitUncapAfter       time.Duration
@@ -175,8 +181,11 @@ func (o *Options) applyDefaults() {
 	if o.RateLimitWindow <= 0 {
 		o.RateLimitWindow = 3 * time.Second
 	}
-	if o.RateLimitDecreaseFactor <= 0 || o.RateLimitDecreaseFactor >= 1 {
-		o.RateLimitDecreaseFactor = 0.9
+	if o.RateLimitDecreaseFactor <= 0 {
+		o.RateLimitDecreaseFactor = 1.2
+	}
+	if o.RateLimitDropFactor <= 0 {
+		o.RateLimitDropFactor = 1.15
 	}
 	if o.RateLimitIncreaseFactor <= 0 {
 		o.RateLimitIncreaseFactor = 0.1

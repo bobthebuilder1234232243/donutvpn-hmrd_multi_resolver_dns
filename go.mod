@@ -1,4 +1,4 @@
-module github.com/hiddify/hmrd_multi_resolver_dns
+module github.com/bobthebuilder1234232243/donutvpn-hmrd_multi_resolver_dns
 
 go 1.25.6
 
